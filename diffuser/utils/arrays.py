@@ -84,9 +84,12 @@ def to_img(x):
     return (array * 255).astype(np.uint8)
 
 def set_device(device):
+	"""Set global device for all tensor operations (call at script entry)."""
+	global DEVICE
 	DEVICE = device
-	if 'cuda' in device:
-		torch.set_default_tensor_type(torch.cuda.FloatTensor)
+	if isinstance(device, str) and device == 'cuda': 
+		device = 0
+	torch.cuda.set_device(device)
 
 def batch_to_device(batch, device='cuda:0'):
     vals = [
