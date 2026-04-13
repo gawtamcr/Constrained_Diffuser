@@ -12,14 +12,16 @@ services:
     volumes:
       - .:/workspace/Constrained_Diffuser
       - /tmp/.X11-unix:/tmp/.X11-unix
-    command: >
-      bash -c "
-        cd /workspace/Constrained_Diffuser &&
-        echo 'Ensuring cvxpylayers is installed...' &&
-        /opt/conda/envs/safe_cfm/bin/python3 -m pip install cvxpylayers &&
-        echo 'Starting training...' &&
-        /opt/conda/envs/safe_cfm/bin/python3 -B scripts/train.py --config config.maze2d --dataset maze2d-umaze-v1
-      "
+    command: bash 
     stdin_open: true
     tty: true
     runtime: nvidia
+
+    # -c "
+    #     cd /workspace/Constrained_Diffuser &&
+    #     echo 'Ensuring cvxpylayers is installed...' &&
+    #     /opt/conda/envs/safe_cfm/bin/python3 -m pip install cvxpylayers &&
+    #     echo 'Starting training...' &&
+    #     /opt/conda/envs/safe_cfm/bin/python3 -B scripts/train.py --config config.maze2d --dataset maze2d-umaze-v1
+    #  #/opt/conda/envs/safe_cfm/bin/python3 -B scripts/plan_maze2d.py --config config.maze2d --dataset maze2d-umaze-v1
+    #   "

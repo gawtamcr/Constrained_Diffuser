@@ -18,6 +18,14 @@ from .helpers import (
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 
+# STL compiler integration — imported lazily so the package is usable even
+# if the stl sub-package is not on the path yet.
+try:
+    from diffuser.stl.compiler import compile as stl_compile, split_conjunction
+    _STL_AVAILABLE = True
+except ImportError:
+    _STL_AVAILABLE = False
+
 def run_env(env_name, init_state, u_r):
     env_name.reset()
     env_name.set_state(init_state[:2], init_state[2:])
@@ -133,6 +141,38 @@ class GaussianDiffusion(nn.Module):
         loss_weights = self.get_loss_weights(action_weight, loss_discount, loss_weights)
         self.loss_fn = Losses[loss_type](loss_weights, self.action_dim)
 
+    # ------------------------------------------------------------------
+    # STL barrier registration
+    # ------------------------------------------------------------------
+
+    def set_stl_barriers(self, barriers, num_batch=1):
+        """Replace the constraint functions with compiled STL barriers.
+
+        Call this after constructing GaussianDiffusion and before sampling.
+
+        Args:
+            barriers : list of callables produced by stl.compiler.compile()
+                       or stl.compiler.split_conjunction().
+                       Each barrier has signature:
+                           barrier(traj: Tensor, s: float = 0.0) -> Tensor
+                           returns [batch, horizon]
+            num_batch: batch size for dual variable allocation (default 1)
+        """
+        self.g_x_funcs = barriers
+        num_constraints = len(barriers)
+        device = self.betas.device
+
+        self.safe = torch.zeros(num_constraints)
+        self.dual_vars = torch.zeros(
+            (num_constraints, num_batch, self.horizon),
+            dtype=torch.float32, device=device,
+        )
+        if self.algorithm == 'augmented_lagrangian':
+            self.slack_variables = torch.zeros(
+                (num_constraints, num_batch, self.horizon),
+                dtype=torch.float32, device=device,
+            )
+
     def get_loss_weights(self, action_weight, discount, weights_dict):
         '''
             sets loss coefficients for trajectory
@@ -178,7 +218,7 @@ class GaussianDiffusion(nn.Module):
             return noise
 
     
-    def q_posterior(self, x_start, x_t, t):
+    def q_posterior(self, x_start, x_t, t, s: float = 0.0):
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -187,7 +227,7 @@ class GaussianDiffusion(nn.Module):
             # ['primal_dual', 'projected_gradient', 'augmented_lagrangian', 'admm']
             cbf = False
             if self.algorithm == 'primal_dual':
-                grad, vio = self.calc_grad(x_t)
+                grad, vio = self.calc_grad(x_t, s)
 
                 if cbf:
                     shift_dual = self.dual_vars[:,:,:-1]
@@ -195,12 +235,12 @@ class GaussianDiffusion(nn.Module):
                     padding_dual = torch.cat([padding, shift_dual], dim=2)
 
                     posterior_mean = posterior_mean + torch.sum(padding_dual.unsqueeze(-1) * grad, dim=0) - (1-self.alpha) * torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0)
-                    
+
                 else:
                     posterior_mean = posterior_mean + torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0) * (-1 if self.use_equality else 1)
-                self.dual_update(x_t, cbf)
+                self.dual_update(x_t, cbf, s=s)
             elif self.algorithm == 'augmented_lagrangian':
-                grad, vio = self.calc_grad(x_t)
+                grad, vio = self.calc_grad(x_t, s)
                 if cbf:
                     shift_dual = self.dual_vars[:,:,:-1]
                     padding = torch.zeros((self.dual_vars.shape[0],self.dual_vars.shape[1], 1), dtype=torch.float32, device=posterior_mean.device)
@@ -218,13 +258,13 @@ class GaussianDiffusion(nn.Module):
                     posterior_mean = posterior_mean + (- torch.sum(padding_dual.unsqueeze(-1) * grad, dim=0) + (1-self.alpha) * torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0) - self.penalty * torch.sum((vio - (1 - self.alpha)*padding_vio_back - padding_slack).unsqueeze(-1) * grad , dim=0) + self.penalty * (1 - self.alpha) * torch.sum((padding_vio_forw - (1 - self.alpha)*vio - self.slack_variables).unsqueeze(-1) * grad , dim=0))
                 else:
                     posterior_mean = posterior_mean - torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0) - self.penalty * torch.sum((vio - self.slack_variables).unsqueeze(-1) * grad , dim=0)
-                self.dual_update_aug(x_t, cbf)
+                self.dual_update_aug(x_t, cbf, s=s)
 
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, cond, t):
+    def p_mean_variance(self, x, cond, t, s: float = 0.0):
         x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, cond, t))
 
         if self.clip_denoised:
@@ -233,13 +273,11 @@ class GaussianDiffusion(nn.Module):
             assert RuntimeError()
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-                x_start=x_recon, x_t=x, t=t)
+                x_start=x_recon, x_t=x, t=t, s=s)
         return model_mean, posterior_variance, posterior_log_variance
     
-    def p_mean_variance_langevin(self, x, cond, t):
+    def p_mean_variance_langevin(self, x, cond, t, s: float = 0.0):
         x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, cond, t))
-        # print('x_recon', x_recon)
-
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
@@ -247,10 +285,8 @@ class GaussianDiffusion(nn.Module):
             assert RuntimeError()
         sqrt_one_minus_alphas_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
         sqrt_alpha = extract(self.sqrt_alphas_cumprod, t, x.shape)
-        # print('sqrt_alpha', sqrt_alpha)
         alphas_cumprod = extract(self.alphas_cumprod, t, x.shape)
         score = (sqrt_alpha * x_recon - x) / (1 - alphas_cumprod)
-        # print('score', score)
 
         posterior_variance = extract(self.posterior_variance, t, x.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x.shape)
@@ -262,7 +298,7 @@ class GaussianDiffusion(nn.Module):
             # ['primal_dual', 'projected_gradient', 'augmented_lagrangian']
             cbf = False
             if self.algorithm == 'primal_dual':
-                grad, vio = self.calc_grad(x_t)
+                grad, vio = self.calc_grad(x_t, s)
 
                 if cbf:
                     shift_dual = self.dual_vars[:,:,:-1]
@@ -270,12 +306,12 @@ class GaussianDiffusion(nn.Module):
                     padding_dual = torch.cat([padding, shift_dual], dim=2)
 
                     posterior_mean = posterior_mean + torch.sum(padding_dual.unsqueeze(-1) * grad, dim=0) - (1-self.alpha) * torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0)
-                    
+
                 else:
                     posterior_mean = posterior_mean + torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0) * (-1 if self.use_equality else 1)
-                self.dual_update(x_t, cbf)
+                self.dual_update(x_t, cbf, s=s)
             elif self.algorithm == 'augmented_lagrangian':
-                grad, vio = self.calc_grad(x_t)
+                grad, vio = self.calc_grad(x_t, s)
                 if cbf:
                     shift_dual = self.dual_vars[:,:,:-1]
                     padding = torch.zeros((self.dual_vars.shape[0],self.dual_vars.shape[1], 1), dtype=torch.float32, device=posterior_mean.device)
@@ -293,86 +329,88 @@ class GaussianDiffusion(nn.Module):
                     posterior_mean = posterior_mean + (- torch.sum(padding_dual.unsqueeze(-1) * grad, dim=0) + (1-self.alpha) * torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0) - self.penalty * torch.sum((vio - (1 - self.alpha)*padding_vio_back - padding_slack).unsqueeze(-1) * grad , dim=0) + self.penalty * (1 - self.alpha) * torch.sum((padding_vio_forw - (1 - self.alpha)*vio - self.slack_variables).unsqueeze(-1) * grad , dim=0))
                 else:
                     posterior_mean = posterior_mean - torch.sum(self.dual_vars.unsqueeze(-1) * grad, dim=0) - self.penalty * torch.sum((vio - self.slack_variables).unsqueeze(-1) * grad , dim=0)
-                self.dual_update_aug(x_t, cbf)
+                self.dual_update_aug(x_t, cbf, s=s)
 
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def calc_grad(self, x):
-            """
-            Calculate gradients for multiple g(x) functions.
-            
+    def calc_grad(self, x, s: float = 0.0):
+            """Calculate gradients for all barrier / g(x) functions.
+
             Args:
-            - x (torch.Tensor): Input state tensor
-            
+                x : [batch, horizon, transition_dim] noisy trajectory tensor
+                s : denoising progress in [0, 1]  (1 - t / n_timesteps).
+                    Forwarded to STL barriers so Eventually funnels work.
+
             Returns:
-            - torch.Tensor: Gradient tensor
+                grads : [n_constraints, batch, horizon, transition_dim]
+                vios  : [n_constraints, batch, horizon]
             """
             with torch.enable_grad():
                 state = x.clone().detach().requires_grad_(True)
-                
-                # Accumulate g(x) for all functions
+
                 grads = []
                 vios = []
                 for g_x_func in self.g_x_funcs:
-                    # Apply the user-defined g(x) function
-                    g_x = g_x_func(state)
+                    # Support both the legacy signature g(state) and the new
+                    # STL signature g(state, s).
+                    try:
+                        g_x = g_x_func(state, s)
+                    except (TypeError, IndexError):
+                        g_x = g_x_func(state)
+
                     grad = torch.autograd.grad(g_x.sum(), state)[0]
                     vio = g_x
 
                     grads.append(grad)
                     vios.append(vio)
                 self.safe = torch.vstack(vios)
-                return torch.stack(grads,dim=0), torch.stack(vios, dim=0)
+                return torch.stack(grads, dim=0), torch.stack(vios, dim=0)
         
-    def dual_update(self, x, cbf, learning_rate=2.5e-2):
+    def dual_update(self, x, cbf, learning_rate=2.5e-2, s: float = 0.0):
 
         if cbf == False:
             for i, g_x_func in enumerate(self.g_x_funcs):
-                # Apply the user-defined g(x) function
-                g_x = g_x_func(x)
-                
-                # Update dual variables
+                try:
+                    g_x = g_x_func(x, s)
+                except (TypeError, IndexError):
+                    g_x = g_x_func(x)
+
                 if self.use_equality:
-                    
                     self.dual_vars[i] = self.dual_vars[i] + self.penalty * g_x.squeeze(-1)
                 else:
                     self.dual_vars[i] = torch.clamp(
-                        self.dual_vars[i] - learning_rate * g_x.squeeze(-1), 
+                        self.dual_vars[i] - learning_rate * g_x.squeeze(-1),
                         min=0
                     )
         else:
             for i, g_x_func in enumerate(self.g_x_funcs):
                 for t in range(self.horizon-1):
-                    # print()
                     self.dual_vars[i,:, t] = torch.clamp(
-                            self.dual_vars[i,:, t] - learning_rate * (g_x_func(x,t+1) - (1 - self.alpha)*g_x_func(x, t)).squeeze(-1), 
+                            self.dual_vars[i,:, t] - learning_rate * (g_x_func(x,t+1) - (1 - self.alpha)*g_x_func(x, t)).squeeze(-1),
                             min=0
                         )
 
-    def dual_update_aug(self, x, cbf):
+    def dual_update_aug(self, x, cbf, s: float = 0.0):
 
         if cbf == False:
             for i, g_x_func in enumerate(self.g_x_funcs):
-                # Apply the user-defined g(x) function
-                g_x = g_x_func(x)
-                
-                # Update dual variables
+                try:
+                    g_x = g_x_func(x, s)
+                except (TypeError, IndexError):
+                    g_x = g_x_func(x)
+
                 if self.use_equality:
                     self.dual_vars[i] = self.dual_vars[i] + self.penalty * (g_x.squeeze(-1) - self.slack_variables[i])
                 else:
-
                     self.slack_variables[i] = torch.clamp(self.dual_vars[i] / self.penalty + g_x.squeeze(-1), min=0)
                     self.dual_vars[i] = self.dual_vars[i] + self.penalty * (g_x.squeeze(-1) - self.slack_variables[i])
                     self.penalty *= 1.0002
 
         else:
             for i, g_x_func in enumerate(self.g_x_funcs):
-            # Apply the user-defined g(x) function
                 for t in range(self.horizon-1):
-
                     g_x = g_x_func(x)
-                    
-                    # Update dual variables
+
                     if self.use_equality:
                         self.dual_vars[i,:,t] = self.dual_vars[i,:,t] + self.penalty * (g_x.squeeze(-1) - self.slack_variables[i])
                     else:
@@ -380,80 +418,73 @@ class GaussianDiffusion(nn.Module):
                         self.dual_vars[i,:,t] = self.dual_vars[i,:,t] + self.penalty * ((g_x_func(x,t+1) - (1 - self.alpha)*g_x_func(x, t)).squeeze(-1) - self.slack_variables[i,:,t])
                         self.penalty *= 1.0001
 
-    def _project_to_feasible_region(self, x):
-        """
-        Simple projection method to handle constraints
-        
+    def _project_to_feasible_region(self, x, s: float = 0.0):
+        """Project trajectory onto the feasible region using a single Newton step.
+
+        For each barrier bᵢ(τ), if bᵢ(τ) < 0 (constraint violated), apply:
+
+            τ ← τ + max(0, -bᵢ(τ)) · ∇bᵢ(τ) / ‖∇bᵢ(τ)‖²
+
+        This is a single Newton step onto the zero-level set of bᵢ, which is the
+        closest feasible point for convex barriers and a good local approximation
+        for non-convex ones. Applied sequentially over all constraints.
+
         Args:
-        - x (torch.Tensor): Point to project
-        - constraint_func (callable): Constraint function
-        
+            x : [batch, horizon, transition_dim]  current sample (may be in-place modified)
+            s : denoising progress passed to STL barriers
+
         Returns:
-        - torch.Tensor: Projected point
+            Projected trajectory (same tensor, modified in-place).
         """
-        # Basic implementation - can be made more sophisticated
-        # xr1 = 2 * 1 / (self.norm_maxs[1] - self.norm_mins[1])
-        # yr1 = 2 * 1 / (self.norm_maxs[0] - self.norm_mins[0])
-        # off_x1 = 2 * (5.8 - 0.5 - self.norm_mins[1]) / (self.norm_maxs[1] - self.norm_mins[1]) - 1
-        # off_y1 = 2 * (5 - 0.5 - self.norm_mins[0]) / (self.norm_maxs[0] - self.norm_mins[0]) - 1
-        # for g_x in self.g_x_funcs:
-        #     g = g_x(x)
-        #     for h in range(x.shape[1]):
-        #         if g[:,h,:].squeeze() < 0:
-        #             r = torch.pow((x[:, h, 2] - off_y1) / yr1, 2) + torch.pow((x[:, h, 3] - off_x1) / xr1, 2)
-        #             # print(torch.sqrt(1/r).shape)
-        #             # print(torch.tensor(off_y1).shape)
-        #             # print((x[:, :, 2] - off_y1).shape)
-        #             # print(x[:, h, 2].shape)
-        #             x[:, h, 2] = torch.tensor(off_y1) + torch.sqrt(1/r) * (x[:, h, 2] - off_y1)
-        #             x[:, h, 3] = torch.tensor(off_x1) + torch.sqrt(1/r) * (x[:, h, 3] - off_x1)
-        batch_size, horizon, _ = x.shape
-        # Initialize a mask to track violations across all constraints
-        overall_violation_mask = torch.zeros((batch_size, horizon), dtype=torch.bool, device=x.device)
-
         for g_x_func in self.g_x_funcs:
+            with torch.enable_grad():
+                x_var = x.detach().clone().requires_grad_(True)
+                try:
+                    g = g_x_func(x_var, s)
+                except (TypeError, IndexError):
+                    g = g_x_func(x_var)
 
-            g = g_x_func(x)
-            if g.dim() == 3 and g.shape[-1] == 1:
-                g = g.squeeze(-1) #
+                # g : [batch, horizon]
+                violation = torch.relu(-g)            # positive where violated
 
+                if violation.sum() < 1e-8:
+                    continue                           # already feasible for this barrier
 
-            overall_violation_mask = (g < 0)
+                # Gradient of the barrier w.r.t. trajectory
+                grad = torch.autograd.grad(g.sum(), x_var)[0]  # [batch, horizon, td]
 
-        # Proceed only if there are any violations
-        if torch.any(overall_violation_mask):
-            r = torch.zeros_like(overall_violation_mask, dtype=x.dtype, device=x.device)
+                # ‖∇b‖² per (batch, horizon) position, summed over td
+                grad_norm2 = (grad ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-            x2_violated = x[:, :, 2][overall_violation_mask]
-            x3_violated = x[:, :, 3][overall_violation_mask]
+                # Newton step: move toward feasibility where violated
+                # violation is [batch, horizon]; unsqueeze for broadcast over td
+                step = violation.unsqueeze(-1) * grad / grad_norm2   # [batch, H, td]
 
-            r[overall_violation_mask] = (x2_violated + x3_violated - 1.3) / 2
-
-            x[:, :, 2] -= r
-            x[:, :, 3] -= r
+                x = x + step.detach()
 
         return x
 
 
     @torch.no_grad()
-    def p_sample(self, x, cond, t):
+    def p_sample(self, x, cond, t, s: float = 0.0):
         b, *_, device = *x.shape, x.device
         use_ddpm = True
         if use_ddpm:
-            model_mean, _, model_log_variance = self.p_mean_variance(x=x, cond=cond, t=t)
+            model_mean, _, model_log_variance = self.p_mean_variance(x=x, cond=cond, t=t, s=s)
         else:
-            model_mean, _, model_log_variance = self.p_mean_variance_langevin(x=x, cond=cond, t=t)
+            model_mean, _, model_log_variance = self.p_mean_variance_langevin(x=x, cond=cond, t=t, s=s)
         noise = torch.randn_like(x)
-        # print(model_mean, model_log_variance)
-        # noise = torch.zeros_like(x)  # For Langevin
         # no noise when t == 0
         nonzero_mask = (1 - (t == 1).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         xp1 = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
         if self.is_cons and self.algorithm == 'projected_gradient':
-            xp1 = self._project_to_feasible_region(xp1)
+            xp1 = self._project_to_feasible_region(xp1, s=s)
 
         for g_x in self.g_x_funcs:
-            self.safe = torch.relu(-g_x(xp1)).sum()
+            try:
+                self.safe = torch.relu(-g_x(xp1, s)).sum()
+            except (TypeError, IndexError):
+                self.safe = torch.relu(-g_x(xp1)).sum()
 
         return xp1
     
@@ -461,7 +492,7 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def p_sample_loop(self, shape, cond, verbose=True, env=None, return_diffusion=False):
         device = self.betas.device
-        
+
         batch_size = shape[0]
         x = torch.randn(shape, device=device)
         x = apply_conditioning(x, cond, self.action_dim)
@@ -473,11 +504,16 @@ class GaussianDiffusion(nn.Module):
             if i <= 0:
                 i_ = 1
             elif i > self.n_timesteps:
-                i_ = self.n_timesteps-1
+                i_ = self.n_timesteps - 1
             else:
                 i_ = i
+
+            # Denoising progress s ∈ [0, 1]: 0 at the start (most noise),
+            # 1 at the end (clean sample). Used by Eventually funnels.
+            s = 1.0 - i_ / self.n_timesteps
+
             timesteps = torch.full((batch_size,), i_, device=device, dtype=torch.long)
-            x = self.p_sample(x, cond, timesteps)
+            x = self.p_sample(x, cond, timesteps, s=s)
             x = apply_conditioning(x, cond, self.action_dim)
 
             progress.update({'t': i})
