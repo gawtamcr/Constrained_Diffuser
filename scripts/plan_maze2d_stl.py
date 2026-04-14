@@ -89,8 +89,8 @@ goal_tolerance_norm = GOAL_TOLERANCE_RAW * 2.0 / ((norm_maxs[0] - norm_mins[0] +
 
 # -- Time windows --
 HORIZON = diffusion.horizon
-EVENTUALLY_A = 20
-EVENTUALLY_B = min(40, HORIZON - 1)
+EVENTUALLY_A = 0
+EVENTUALLY_B = min(5, HORIZON - 1)
 
 ACTION_DIM = diffusion.action_dim
 
@@ -99,20 +99,19 @@ ACTION_DIM = diffusion.action_dim
 # ---------------------------------------------------------------------------
 
 def build_stl_barriers(goal_norm_xy):
-    """Build two STL barriers matching the original Constrained Diffuser spec:
-       φ = □[0,H](triangle avoidance) ∧ ◇[20,40](goal reaching)
+    """Build two barriers:
+       - Triangle avoidance: bare Predicate (per-timestep, identical to g_x1)
+       - Goal reaching: ◇[EVENTUALLY_A, EVENTUALLY_B] (temporal, STL addition)
     """
 
-    # φ₁: □[0,H] triangle avoidance — identical to g_x1: 1.3 - obs[0] - obs[1] ≥ 0
-    phi_triangle = Always(
-        Predicate(
-            halfspace_constraint(normal=(1.0, 1.0), offset=1.3, action_dim=ACTION_DIM),
-            name="triangle_avoidance",
-        ),
-        a=0, b=HORIZON - 1,
+    # φ₁: triangle avoidance — bare Predicate with no temporal aggregation,
+    # identical in behaviour to the original g_x1: 1.3 - obs[0] - obs[1] ≥ 0
+    phi_triangle = Predicate(
+        halfspace_constraint(normal=(1.0, 1.0), offset=1.3, action_dim=ACTION_DIM),
+        name="triangle_avoidance",
     )
 
-    # φ₂: ◇[20,40] goal reaching (with funnel slack β₀=0.3)
+    # φ₂: ◇[EVENTUALLY_A, EVENTUALLY_B] goal reaching (with funnel slack β₀=0.3)
     phi_goal = Eventually(
         Predicate(
             goal_reaching(
@@ -123,12 +122,12 @@ def build_stl_barriers(goal_norm_xy):
             name="goal_reaching",
         ),
         a=EVENTUALLY_A, b=EVENTUALLY_B,
-        beta0=0.3,
+        beta0=0.1, # 0.3,
     )
 
     # One dual variable per sub-formula
     full_spec = phi_triangle & phi_goal
-    barriers = split_conjunction(full_spec, kappa=10.0)
+    barriers = split_conjunction(full_spec, kappa=1.0)
     return barriers
 
 
@@ -152,16 +151,17 @@ comp_time = []
 for episode_idx in range(1):
     print(f"\n=== Episode {episode_idx} ===")
 
-    observation = env.reset()
-    # Override start if desired (matches plan_maze2d.py convention)
-    observation = np.array([3.02345623, 2.11975429, 0.02330205, -0.00525413])
+    # Sample a random start position from valid reset locations
+    start_xy = env.reset_locations[np.random.randint(len(env.reset_locations))]
+    observation = env.reset_to_location(start_xy)
     print("start observation:", observation)
 
-    if args.conditional:
-        env.set_target()
-
-    target = env._target
-    target = (0.9, 1.9)   # override for reproducibility
+    # Sample a random goal from valid goal locations (different from start)
+    goal_candidates = [loc for loc in env.goal_locations
+                       if np.linalg.norm(np.array(loc) - np.array(start_xy)) > 0.5]
+    if not goal_candidates:
+        goal_candidates = env.goal_locations
+    target = tuple(goal_candidates[np.random.randint(len(goal_candidates))])
     print("target:", target)
 
     # Normalize goal for STL barrier

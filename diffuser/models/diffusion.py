@@ -522,6 +522,9 @@ class GaussianDiffusion(nn.Module):
 
         progress.close()
 
+        # Store the final normalized transition tensor for external violation metrics
+        self.last_sample = x  # [batch, horizon, transition_dim], normalized
+
         if return_diffusion:
             return x, torch.stack(diffusion, dim=1)
         else:
